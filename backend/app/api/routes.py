@@ -1,51 +1,54 @@
 """
 backend/app/api/routes.py
 
-Wires the full pipeline together:
-  question -> M1 answer_generation -> M2 claim_extraction
-           -> M3 evidence_retrieval + verification -> save to DB -> return
+Full pipeline:
+  question -> M1 generate_answer -> M2 extract_claims
+           -> M3 retrieve_evidence(Claim) -> verify_claim(Claim, Evidence)
+           -> save to SQLite -> return
 
-Uses safe stub fallbacks for M1/M2 so this runs end-to-end even before
-those teammates push their real code. Once P1/P2 push real modules with
-the function signatures below, these routes need zero changes.
+Matches the real signatures:
+  retrieve_evidence(claim: Claim) -> Evidence
+  verify_claim(claim: Claim, evidence: Evidence) -> Claim
 """
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from backend.app.database import get_db
-from backend.app.models.db_models import QueryRecord, ClaimRecord
 from backend.app.config import settings
+from backend.app.database import get_db
+from backend.app.models.db_models import ClaimRecord, QueryRecord
+from backend.app.models.schemas import Claim
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
+MAX_CLAIMS = 10  # keeps a demo run fast; raise later if needed
 
 # ---------------------------------------------------------------------------
-# Try to import real modules; fall back to stubs if a teammate hasn't pushed
-# their part yet. This keeps /api/verify-answer working throughout dev.
+# M1 / M2: use the real modules when they exist, otherwise fall back.
 # ---------------------------------------------------------------------------
 try:
     from backend.app.modules.answer_generation import generate_answer
 except ImportError:
     def generate_answer(question: str) -> str:
-        return f"[STUB ANSWER] answer_generation.py not implemented yet. Question was: {question}"
+        return f"[STUB ANSWER] answer_generation.py not implemented. Question: {question}"
 
 try:
     from backend.app.modules.claim_extraction import extract_claims
 except ImportError:
     def extract_claims(answer_text: str) -> list[str]:
-        # naive fallback: treat each sentence as a claim
-        return [s.strip() for s in answer_text.split(".") if s.strip()]
+        """Naive fallback until P2's real extractor lands: one claim per sentence."""
+        text = answer_text.replace("**", "").replace("\n", " ")
+        parts = [s.strip() for s in text.split(".")]
+        return [p for p in parts if len(p) > 15]
 
-# M3 — your module, should already exist and work
+# M3 (real code)
 from backend.app.modules.evidence_retrieval import retrieve_evidence
 from backend.app.modules.verification import verify_claim
 
 
 # ---------------------------------------------------------------------------
-# Request / response schemas for this router
-# (Full shared Claim schema lives in models/schemas.py, owned by P2)
+# Schemas for this router
 # ---------------------------------------------------------------------------
 class QuestionRequest(BaseModel):
     question: str
@@ -67,51 +70,93 @@ class PipelineResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _to_claim(item, idx: int) -> Claim:
+    """Accept either a plain string or a Claim from the extractor."""
+    if isinstance(item, Claim):
+        return item
+    text = item if isinstance(item, str) else getattr(item, "claim_text", str(item))
+    return Claim(claim_id=f"c{idx}", claim_text=text)
+
+
+def _verdict_str(verdict) -> str:
+    if verdict is None:
+        return "unverifiable"
+    return getattr(verdict, "value", str(verdict))
+
+
+def _serialize_query(rec: QueryRecord) -> dict:
+    return {
+        "query_id": rec.id,
+        "question": rec.question,
+        "answer_text": rec.answer_text,
+        "created_at": rec.created_at.isoformat(),
+        "claims": [
+            {
+                "claim_text": c.claim_text,
+                "verdict": c.verdict,
+                "confidence": c.confidence,
+                "source": c.source,
+                "evidence_snippet": c.evidence_snippet,
+            }
+            for c in rec.claims
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @router.post("/verify-answer", response_model=PipelineResponse)
 def verify_answer(payload: QuestionRequest, db: Session = Depends(get_db)):
-    """Run the full pipeline for a single question and persist the result."""
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty")
 
-    # 1. Generate answer (M1)
-    answer_text = generate_answer(question)
+    # 1. Answer generation (M1)
+    try:
+        answer_text = generate_answer(question)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Answer generation failed: {e}")
 
-    # 2. Extract atomic claims (M2)
-    claim_texts = extract_claims(answer_text)
-    if not claim_texts:
-        raise HTTPException(status_code=422, detail="No claims could be extracted from the answer")
+    # 2. Claim extraction (M2)
+    raw_claims = extract_claims(answer_text)
+    if not raw_claims:
+        raise HTTPException(status_code=422, detail="No claims could be extracted")
 
-    # 3. Retrieve evidence + verify each claim independently (M3)
+    # 3. Evidence retrieval + verification (M3), one claim at a time
     results: list[ClaimResult] = []
-    for claim_text in claim_texts:
-        evidence = retrieve_evidence(claim_text)          # e.g. list of {source, snippet}
-        verdict, confidence, best_evidence = verify_claim(claim_text, evidence)
+    for idx, item in enumerate(raw_claims[:MAX_CLAIMS], start=1):
+        claim = _to_claim(item, idx)
+        try:
+            evidence = retrieve_evidence(claim)
+            verified = verify_claim(claim, evidence)
+        except Exception as e:
+            # One bad claim (network hiccup, etc.) shouldn't kill the whole run
+            verified = claim
+            verified.source = "error"
+            verified.evidence_snippet = f"Verification failed: {e}"
+
         results.append(
             ClaimResult(
-                claim_text=claim_text,
-                verdict=verdict,
-                confidence=confidence,
-                source=best_evidence.get("source") if best_evidence else None,
-                evidence_snippet=best_evidence.get("snippet") if best_evidence else None,
+                claim_text=verified.claim_text,
+                verdict=_verdict_str(verified.verdict),
+                confidence=verified.confidence,
+                source=verified.source,
+                evidence_snippet=verified.evidence_snippet,
             )
         )
 
-    # 4. Persist to DB
+    # 4. Save to DB
     query_record = QueryRecord(
         question=question,
         answer_text=answer_text,
-        llm_provider=settings.DEFAULT_LLM_PROVIDER,
-        llm_model=(
-            settings.DEFAULT_MODEL_OPENAI
-            if settings.DEFAULT_LLM_PROVIDER == "openai"
-            else settings.DEFAULT_MODEL_GROQ
-        ),
+        llm_provider=settings.LLM_PROVIDER,
+        llm_model=settings.LLM_MODEL,
     )
     db.add(query_record)
-    db.flush()  # get query_record.id before commit
+    db.flush()  # get the id before commit
 
     for r in results:
         db.add(
@@ -137,32 +182,13 @@ def verify_answer(payload: QuestionRequest, db: Session = Depends(get_db)):
 
 @router.get("/history")
 def get_history(limit: int = 20, db: Session = Depends(get_db)):
-    """Return the most recent pipeline runs, newest first (for M4 frontend)."""
     records = (
         db.query(QueryRecord)
         .order_by(QueryRecord.created_at.desc())
         .limit(limit)
         .all()
     )
-    return [
-        {
-            "query_id": rec.id,
-            "question": rec.question,
-            "answer_text": rec.answer_text,
-            "created_at": rec.created_at.isoformat(),
-            "claims": [
-                {
-                    "claim_text": c.claim_text,
-                    "verdict": c.verdict,
-                    "confidence": c.confidence,
-                    "source": c.source,
-                    "evidence_snippet": c.evidence_snippet,
-                }
-                for c in rec.claims
-            ],
-        }
-        for rec in records
-    ]
+    return [_serialize_query(rec) for rec in records]
 
 
 @router.get("/history/{query_id}")
@@ -170,19 +196,4 @@ def get_history_item(query_id: int, db: Session = Depends(get_db)):
     rec = db.query(QueryRecord).filter(QueryRecord.id == query_id).first()
     if not rec:
         raise HTTPException(status_code=404, detail="query_id not found")
-    return {
-        "query_id": rec.id,
-        "question": rec.question,
-        "answer_text": rec.answer_text,
-        "created_at": rec.created_at.isoformat(),
-        "claims": [
-            {
-                "claim_text": c.claim_text,
-                "verdict": c.verdict,
-                "confidence": c.confidence,
-                "source": c.source,
-                "evidence_snippet": c.evidence_snippet,
-            }
-            for c in rec.claims
-        ],
-    }
+    return _serialize_query(rec)
