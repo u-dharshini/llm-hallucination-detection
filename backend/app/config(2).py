@@ -24,15 +24,6 @@ class Settings(BaseSettings):
     DEFAULT_MODEL_OPENAI: str = "gpt-4o-mini"
     DEFAULT_MODEL_GROQ: str = "llama-3.1-70b-versatile"
 
-    # Aliases kept for compatibility with modules written by teammates
-    # that expect these exact names (e.g. answer_generation.py uses
-    # settings.LLM_PROVIDER and settings.LLM_MODEL). Keep values in sync
-    # with the DEFAULT_* ones above.
-    LLM_PROVIDER: str = "openai"
-    LLM_MODEL: str = "gpt-4o-mini"   # set to a Groq model name in .env if LLM_PROVIDER=groq
-    MODEL_OPENAI: str = "gpt-4o-mini"
-    MODEL_GROQ: str = "llama-3.1-70b-versatile"
-
     # --- Evidence retrieval (M3) ---
     SEMANTIC_SCHOLAR_API_KEY: str = ""     # optional, raises rate limit if set
     WIKIPEDIA_LANG: str = "en"
