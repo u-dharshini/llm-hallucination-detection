@@ -42,6 +42,46 @@ Answer: "{answer}"
 Response:"""
 
 
+def _strip_markdown(text: str) -> str:
+    """
+    Removes Markdown formatting (bold/italic markers, tables, headers)
+    that LLMs often add to answers. Claim extraction works much better
+    on plain text — Markdown tables in particular have no sentence-
+    ending punctuation, which breaks both the LLM-based splitter and
+    the fallback sentence-splitter.
+    """
+    cleaned = text
+
+    # Remove bold/italic markers: **text** or *text* -> text
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
+
+    # Convert Markdown table rows into plain comma-separated phrases.
+    # A table row looks like: | Event | Date |  or  | Groundbreaking | March 28, 1887 |
+    # We turn each row into "Event: Date" style text, and drop pure
+    # separator rows like |---|---|.
+    lines = cleaned.split("\n")
+    rebuilt_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\|?[\s\-:|]+\|?$", stripped) and "|" in stripped:
+            continue  # skip table separator rows like |---|---|
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|") if c.strip()]
+            if cells:
+                rebuilt_lines.append(": ".join(cells) + ".")
+            continue
+        rebuilt_lines.append(line)
+
+    cleaned = "\n".join(rebuilt_lines)
+
+    # Collapse multiple blank lines/whitespace into single spaces
+    cleaned = re.sub(r"\n+", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
 def _call_llm_for_extraction(answer: str) -> str:
     """Sends the extraction prompt to whichever provider is configured and
     returns the raw text response."""
@@ -113,15 +153,17 @@ def extract_claims(answer: str) -> List[Claim]:
     if not answer or not answer.strip():
         return []
 
+    cleaned_answer = _strip_markdown(answer)
+
     try:
-        raw_response = _call_llm_for_extraction(answer)
+        raw_response = _call_llm_for_extraction(cleaned_answer)
         claim_texts = _parse_claims_json(raw_response)
         if not claim_texts:
             raise ValueError("LLM returned an empty claims list")
     except Exception:
         # LLM extraction failed (no API key, bad JSON, network issue, etc.)
         # — fall back to simple sentence splitting rather than crash.
-        claim_texts = _fallback_sentence_split(answer)
+        claim_texts = _fallback_sentence_split(cleaned_answer)
 
     return [
         Claim(claim_id=f"c{i+1}", claim_text=text)
