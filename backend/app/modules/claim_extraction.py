@@ -71,6 +71,21 @@ def _strip_markdown(text: str) -> str:
             if cells:
                 rebuilt_lines.append(": ".join(cells) + ".")
             continue
+
+        # Handle bullet/numbered list items: "- Designers: ..." or "1. Start: ..."
+        # Strip the leading marker and make sure the line ends with a period,
+        # so each bullet becomes its own clean sentence instead of running
+        # together with the next one (which breaks both the LLM-based
+        # extraction and the fallback sentence-splitter).
+        bullet_match = re.match(r"^(?:[-*•]|\d+\.)\s*(.+)", stripped)
+        if bullet_match:
+            content = bullet_match.group(1).strip()
+            if content and not content.endswith((".", "!", "?")):
+                content += "."
+            if content:
+                rebuilt_lines.append(content)
+            continue
+
         rebuilt_lines.append(line)
 
     cleaned = "\n".join(rebuilt_lines)
