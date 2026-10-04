@@ -62,11 +62,45 @@ def _strip_markdown(text: str) -> str:
     # separator rows like |---|---|.
     lines = cleaned.split("\n")
     rebuilt_lines = []
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         if re.match(r"^\|?[\s\-:|]+\|?$", stripped) and "|" in stripped:
             continue  # skip table separator rows like |---|---|
+
+        # Skip horizontal rule lines: ---, ***, ___ (3 or more repeated chars)
+        if re.match(r"^([-*_])\1{2,}$", stripped):
+            continue
+
+        # Markdown headers: # Heading, ## Heading, etc. Strip the hashes,
+        # and drop the line entirely if what's left is trivial/empty
+        # (e.g. "## 1." becomes just "1." which isn't a real claim).
+        header_match = re.match(r"^#{1,6}\s*(.+)", stripped)
+        if header_match:
+            content = header_match.group(1).strip()
+            # A header's content may itself start with a numbered-list
+            # marker, e.g. "## 1. Why the sky looks blue" -> after
+            # stripping "##", content is "1. Why the sky looks blue".
+            # Strip that leading number too, or it later gets mis-split
+            # into an orphan "1." claim with no real content.
+            numbered = re.match(r"^\d+\.\s*(.+)", content)
+            if numbered:
+                content = numbered.group(1).strip()
+            if content and not re.match(r"^[\d.\s]*$", content):
+                if not content.endswith((".", "!", "?", ":")):
+                    content += "."
+                rebuilt_lines.append(content)
+            continue
+
         if stripped.startswith("|") and stripped.endswith("|"):
+            # Check if this row is a table HEADER row (e.g. "Step | What
+            # happens | Why it matters") by checking if the next line is
+            # a separator row (|---|---|---|). Header rows are column
+            # labels, not factual claims, so skip them entirely.
+            next_stripped = lines[idx + 1].strip() if idx + 1 < len(lines) else ""
+            next_is_separator = bool(re.match(r"^\|?[\s\-:|]+\|?$", next_stripped)) and "|" in next_stripped
+            if next_is_separator:
+                continue
+
             cells = [c.strip() for c in stripped.strip("|").split("|") if c.strip()]
             if cells:
                 rebuilt_lines.append(": ".join(cells) + ".")
