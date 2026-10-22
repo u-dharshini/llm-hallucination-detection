@@ -9,10 +9,11 @@ Stage 3.
 
 Strategy:
   1. Primary: ask an LLM to do the splitting (it understands grammar,
-     coreference, and conjunctions much better than rule-based tools).
-  2. Fallback: if the LLM call fails for any reason (no API key, network
-     issue, bad JSON response), fall back to a simple sentence-splitter
-     so the pipeline never completely breaks.
+     coreference and conjunctions far better than rule-based tools).
+  2. If the LLM returns an empty list, retry once with a stricter prompt.
+  3. Fallback: if the LLM still fails (no API key, network issue, bad
+     JSON, empty result), use a simple sentence splitter so the pipeline
+     never completely breaks.
 
 Owner: P2
 Location in repo: backend/app/modules/claim_extraction.py
@@ -26,29 +27,34 @@ from ..config import settings
 from ..models.schemas import Claim
 
 
-_EXTRACTION_PROMPT = """You are a fact-checking assistant. Break the following \
-answer into a list of short, independent, atomic factual claims. Each claim \
-should state exactly one fact and be understandable on its own (resolve \
-pronouns like "he"/"it" into the actual subject).
+_SYSTEM_PROMPT = """You extract factual claims from text for a fact-checking system.
 
-Respond with ONLY a JSON array of strings, nothing else. No markdown, no \
-explanation, no code fences.
+Rules:
+- Break the text into short, independent, atomic factual claims. Each claim states exactly one fact.
+- Make every claim understandable on its own: replace pronouns and vague references ("it", "the tower", "he") with the actual subject.
+- Include facts that appear inside parentheses.
+- Extract exactly what the text asserts. Do NOT correct, judge, verify or add information, even if a statement looks wrong.
+- Never return an empty list if the text contains any factual statement.
+- Respond with ONLY a JSON array of strings. No markdown, no code fences, no commentary.
 
-Example:
-Answer: "The Eiffel Tower was built in 1887 by Gustave Eiffel."
-Response: ["The Eiffel Tower was built in 1887.", "Gustave Eiffel built the Eiffel Tower."]
+Example input:
+The Eiffel Tower was built in 1887 by Gustave Eiffel (a French engineer).
+Example output:
+["The Eiffel Tower was built in 1887.", "Gustave Eiffel built the Eiffel Tower.", "Gustave Eiffel was a French engineer."]"""
 
-Answer: "{answer}"
-Response:"""
+_USER_TEMPLATE = 'Text:\n\"\"\"{answer}\"\"\"\n\nJSON array of claims:'
+
+_RETRY_NOTE = (
+    "\n\nYour previous reply was an empty list. The text above DOES contain "
+    "factual statements. List every one of them as a JSON array of strings."
+)
 
 
 def _strip_markdown(text: str) -> str:
     """
-    Removes Markdown formatting (bold/italic markers, tables, headers)
-    that LLMs often add to answers. Claim extraction works much better
-    on plain text — Markdown tables in particular have no sentence-
-    ending punctuation, which breaks both the LLM-based splitter and
-    the fallback sentence-splitter.
+    Removes Markdown formatting (bold/italic markers, tables, headers,
+    bullet and numbered lists, horizontal rules) that LLMs often add to
+    answers. Claim extraction works much better on plain text.
     """
     cleaned = text
 
@@ -56,32 +62,25 @@ def _strip_markdown(text: str) -> str:
     cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
     cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
 
-    # Convert Markdown table rows into plain comma-separated phrases.
-    # A table row looks like: | Event | Date |  or  | Groundbreaking | March 28, 1887 |
-    # We turn each row into "Event: Date" style text, and drop pure
-    # separator rows like |---|---|.
     lines = cleaned.split("\n")
     rebuilt_lines = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        if re.match(r"^\|?[\s\-:|]+\|?$", stripped) and "|" in stripped:
-            continue  # skip table separator rows like |---|---|
 
-        # Skip horizontal rule lines: ---, ***, ___ (3 or more repeated chars)
+        # Table separator rows like |---|---|
+        if re.match(r"^\|?[\s\-:|]+\|?$", stripped) and "|" in stripped:
+            continue
+
+        # Horizontal rules: ---, ***, ___
         if re.match(r"^([-*_])\1{2,}$", stripped):
             continue
 
-        # Markdown headers: # Heading, ## Heading, etc. Strip the hashes,
-        # and drop the line entirely if what's left is trivial/empty
-        # (e.g. "## 1." becomes just "1." which isn't a real claim).
+        # Headers: "## 1. Why the sky is blue" -> "Why the sky is blue."
         header_match = re.match(r"^#{1,6}\s*(.+)", stripped)
         if header_match:
             content = header_match.group(1).strip()
-            # A header's content may itself start with a numbered-list
-            # marker, e.g. "## 1. Why the sky looks blue" -> after
-            # stripping "##", content is "1. Why the sky looks blue".
-            # Strip that leading number too, or it later gets mis-split
-            # into an orphan "1." claim with no real content.
+            # Strip a leading list number too, or it later splits into an
+            # orphan "1." claim.
             numbered = re.match(r"^\d+\.\s*(.+)", content)
             if numbered:
                 content = numbered.group(1).strip()
@@ -91,26 +90,21 @@ def _strip_markdown(text: str) -> str:
                 rebuilt_lines.append(content)
             continue
 
+        # Table rows: skip header rows (followed by a separator row),
+        # turn data rows into "cell: cell: cell." sentences.
         if stripped.startswith("|") and stripped.endswith("|"):
-            # Check if this row is a table HEADER row (e.g. "Step | What
-            # happens | Why it matters") by checking if the next line is
-            # a separator row (|---|---|---|). Header rows are column
-            # labels, not factual claims, so skip them entirely.
             next_stripped = lines[idx + 1].strip() if idx + 1 < len(lines) else ""
-            next_is_separator = bool(re.match(r"^\|?[\s\-:|]+\|?$", next_stripped)) and "|" in next_stripped
+            next_is_separator = (
+                bool(re.match(r"^\|?[\s\-:|]+\|?$", next_stripped)) and "|" in next_stripped
+            )
             if next_is_separator:
                 continue
-
             cells = [c.strip() for c in stripped.strip("|").split("|") if c.strip()]
             if cells:
                 rebuilt_lines.append(": ".join(cells) + ".")
             continue
 
-        # Handle bullet/numbered list items: "- Designers: ..." or "1. Start: ..."
-        # Strip the leading marker and make sure the line ends with a period,
-        # so each bullet becomes its own clean sentence instead of running
-        # together with the next one (which breaks both the LLM-based
-        # extraction and the fallback sentence-splitter).
+        # Bullet / numbered list items: make each its own sentence.
         bullet_match = re.match(r"^(?:[-*•]|\d+\.)\s*(.+)", stripped)
         if bullet_match:
             content = bullet_match.group(1).strip()
@@ -123,54 +117,49 @@ def _strip_markdown(text: str) -> str:
         rebuilt_lines.append(line)
 
     cleaned = "\n".join(rebuilt_lines)
-
-    # Collapse multiple blank lines/whitespace into single spaces
     cleaned = re.sub(r"\n+", " ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
-
     return cleaned.strip()
 
 
-def _call_llm_for_extraction(answer: str) -> str:
+def _call_llm_for_extraction(answer: str, strict: bool = False) -> str:
     """Sends the extraction prompt to whichever provider is configured and
-    returns the raw text response."""
-    prompt = _EXTRACTION_PROMPT.format(answer=answer)
+    returns the raw text response. `strict=True` adds a note used when the
+    first attempt came back empty."""
+    user_content = _USER_TEMPLATE.format(answer=answer)
+    if strict:
+        user_content += _RETRY_NOTE
+
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
     provider = settings.LLM_PROVIDER.lower()
 
     if provider == "openai":
         from openai import OpenAI
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.0,  # deterministic — we want consistent splitting, not creativity
-        )
-        return response.choices[0].message.content.strip()
-
     elif provider == "groq":
         from groq import Groq
         client = Groq(api_key=settings.GROQ_API_KEY)
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.0,
-        )
-        return response.choices[0].message.content.strip()
-
     else:
         raise RuntimeError(f"Unknown LLM_PROVIDER '{provider}'")
+
+    response = client.chat.completions.create(
+        model=settings.LLM_MODEL,
+        messages=messages,
+        max_tokens=1000,
+        temperature=0.0,  # deterministic — consistent splitting, not creativity
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 def _parse_claims_json(raw_text: str) -> List[str]:
     """
     Parses the LLM's JSON array response into a list of claim strings.
-    Handles the common case where the model wraps the JSON in markdown
-    code fences despite being told not to.
+    Handles the case where the model wraps the JSON in markdown fences.
     """
     cleaned = raw_text.strip()
-    # Strip ```json ... ``` or ``` ... ``` wrapping if the model added it anyway
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
@@ -184,12 +173,21 @@ def _parse_claims_json(raw_text: str) -> List[str]:
 def _fallback_sentence_split(answer: str) -> List[str]:
     """
     Naive fallback: split on sentence-ending punctuation. Used only if
-    the LLM-based extraction above fails for any reason, so the pipeline
-    degrades gracefully instead of crashing.
+    LLM-based extraction fails, so the pipeline degrades gracefully.
     """
-    # Split on '.', '!', '?' followed by a space or end of string
     sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
     return [s.strip() for s in sentences if s.strip()]
+
+
+def _extract_with_llm(cleaned_answer: str) -> List[str]:
+    """Runs LLM extraction, retrying once with a stricter prompt if the
+    first attempt returns an empty list. Raises if both attempts fail."""
+    claims = _parse_claims_json(_call_llm_for_extraction(cleaned_answer))
+    if not claims:
+        claims = _parse_claims_json(_call_llm_for_extraction(cleaned_answer, strict=True))
+    if not claims:
+        raise ValueError("LLM returned an empty claims list twice")
+    return claims
 
 
 def extract_claims(answer: str) -> List[Claim]:
@@ -197,7 +195,7 @@ def extract_claims(answer: str) -> List[Claim]:
     Main entry point. Takes a raw LLM answer and returns a list of
     Claim objects, each with a unique claim_id and claim_text set.
     Verdict/confidence/source/evidence fields are left empty here —
-    they get filled in later by the verification stage (M3).
+    they are filled in later by the verification stage (M3).
     """
     if not answer or not answer.strip():
         return []
@@ -205,16 +203,21 @@ def extract_claims(answer: str) -> List[Claim]:
     cleaned_answer = _strip_markdown(answer)
 
     try:
-        raw_response = _call_llm_for_extraction(cleaned_answer)
-        claim_texts = _parse_claims_json(raw_response)
-        if not claim_texts:
-            raise ValueError("LLM returned an empty claims list")
+        claim_texts = _extract_with_llm(cleaned_answer)
     except Exception:
-        # LLM extraction failed (no API key, bad JSON, network issue, etc.)
-        # — fall back to simple sentence splitting rather than crash.
+        # No API key, bad JSON, network issue, or empty result twice —
+        # fall back to simple sentence splitting rather than crash.
         claim_texts = _fallback_sentence_split(cleaned_answer)
 
+    # Remove exact duplicates while keeping order.
+    seen = set()
+    unique_texts = []
+    for text in claim_texts:
+        if text not in seen:
+            seen.add(text)
+            unique_texts.append(text)
+
     return [
-        Claim(claim_id=f"c{i+1}", claim_text=text)
-        for i, text in enumerate(claim_texts)
+        Claim(claim_id=f"c{i + 1}", claim_text=text)
+        for i, text in enumerate(unique_texts)
     ]
